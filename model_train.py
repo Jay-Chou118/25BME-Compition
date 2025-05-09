@@ -1,0 +1,113 @@
+"""
+作者：yueyue
+日期：2023年10月31日
+训练FCN模型10次
+"""
+import pyts
+import torch
+from torch import nn
+from model.TCN_oscale import TCN as MACNN
+from d2l import torch as d2l
+from utils import adjust_lr
+from utils import count_parameters
+from dataloader.dataloader import data_generator,get_K_fold_crossvalidation_data,Bcgdataset
+from config_files.configs import Config
+from trainer.training_evaluation import model_evaluate2,train
+import random
+from tsai.all import ResCNN #真无语啊真无语，你是个什么洞悉
+import numpy as np
+device_cuda = 2
+config = Config()
+def normal_Trainer(model,train_dl,test_dl,device,train_len,test_len):
+    train_ls, test_ls = [], []
+    train_acces, test_acces = [], []
+    train_VF_acc_set, train_SR_acc_set, train_MA_acc_set = [], [], []
+    valid_VF_acc_set, valid_SR_acc_set, valid_MA_acc_set = [], [], []
+    label_classifier = model(1,3,conv_dropout=0.1)
+    label_classifier = label_classifier.to(device)
+    print(f'The model has {count_parameters(label_classifier):,} trainable parameters')
+    optimizer = torch.optim.Adam(label_classifier.parameters(), lr=config.lr, betas=(config.beta1, config.beta2),
+                               weight_decay=config.weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    for epoch in range(config.num_epoch):
+        adjust_lr(config.lr, epoch, optimizer)
+        train_loss, train_acc, VF_acc, SR_acc, MA_acc = train(label_classifier,optimizer,criterion,train_dl,device)
+        test_loss, test_acc, VF_test_acc, SR_test_acc, MA_test_acc = model_evaluate2(label_classifier, test_dl,
+                                                                                    criterion, device,test_len)
+        if config.save_ckp and epoch % 10 == 0:
+            print(f'输出当前{epoch}epoch的训练')
+            log_dirfile_best = 'ck_p2/checkpoint_epoch=' + str(epoch) + 'normaltrain.pt'
+            torch.save(label_classifier.state_dict(), log_dirfile_best)
+        print('epoch: {}, Train Loss: {:.4f}, Train Acc: {:.4f},  VF acc: {:.4f},SR acc: {:.4f},MA acc:{:.4f}\n'
+              '          Test Loss: {:.4f}, Test Acc: {:.4f},  VF acc:{:.4f},SR acc:{:.4f},MA acc:{:.4f}'
+              .format(epoch, train_loss, train_acc, VF_acc, SR_acc, MA_acc,
+                      test_loss, test_acc, VF_test_acc, SR_test_acc, MA_test_acc))
+    train_ls.append(train_loss)
+    test_ls.append(test_loss)
+    train_acces.append(train_acc)
+    test_acces.append(test_acc)
+    train_VF_acc_set.append(VF_acc)
+    train_SR_acc_set.append(SR_acc)
+    train_MA_acc_set.append(MA_acc)
+    valid_VF_acc_set.append(VF_test_acc)
+    valid_SR_acc_set.append(SR_test_acc)
+    valid_MA_acc_set.append(MA_test_acc)
+    return train_ls, test_ls, train_acces, test_acces, train_VF_acc_set, train_SR_acc_set, train_MA_acc_set, valid_VF_acc_set, valid_SR_acc_set, valid_MA_acc_set
+def k_fold_normal(model, k, dataset, device, pig_train_set):
+    '''K折交叉验证训练'''
+    train_l_sum, valid_l_sum = 0, 0
+    train_acc_sum, valid_acc_sum = 0, 0
+    t_VF, t_SR, t_MA = 0, 0, 0
+    v_VF, v_SR, v_MA = 0, 0, 0
+    random.shuffle(pig_train_set)
+    print('打乱后的训练集', pig_train_set)
+    for i in range(k):
+        data = get_K_fold_crossvalidation_data(dataset=dataset, pigset=pig_train_set, K=config.k_fold_num, i=i)
+        print(f'第{i}折训练开始')
+        train_iter,test_iter,train_len,test_len = data_generator(*data,config.batch_size)
+        train_ls, valid_ls, train_acc, valid_acc, train_VF_acc_set, train_SR_acc_set, train_MA_acc_set, valid_VF_acc_set, valid_SR_acc_set, valid_MA_acc_set \
+            = normal_Trainer(model,train_iter,test_iter,device,train_len,test_len)
+        valid_l_sum += valid_ls[-1]
+        train_acc_sum += train_acc[-1]
+        valid_acc_sum += valid_acc[-1]
+        t_VF += train_VF_acc_set[-1]
+        t_SR += train_SR_acc_set[-1]
+        t_MA += train_MA_acc_set[-1]
+        v_VF += valid_VF_acc_set[-1]
+        v_SR += valid_SR_acc_set[-1]
+        v_MA += valid_MA_acc_set[-1]
+        print(f'fold{i + 1},trainloss{float(train_ls[-1]):f},validloss{float(valid_ls[-1]):f}')
+    return train_l_sum / k, valid_l_sum / k, train_acc_sum / k, valid_acc_sum / k, t_VF / k, t_SR / k, t_MA / k, v_VF / k, v_SR / k, v_MA / k
+
+if __name__ == "__main__":
+    root = './data/'
+    BCGdata = Bcgdataset(root,config.preprocessing_method_acf)
+    print(f'acf处理:{config.preprocessing_method_acf}')
+    device = d2l.try_gpu(device_cuda)
+    tacc_set = []
+    vacc_set = []
+    t_VF_set, t_SR_set, t_MA_set = [], [], []
+    v_VF_set, v_SR_set, v_MA_set = [], [], []
+    model = MACNN
+    for index_average in range(config.n_average_times):
+        tl, vl, tacc, vacc, t_VF, t_SR, t_MA, v_VF, v_SR, v_MA = k_fold_normal(model, config.k_fold_num, BCGdata, device, config.pig_train_set)
+        print(f'第{index_average}次{config.k_fold_num}折交叉训练，得到平均指标，train loss:{tl},valid_loss:{vl},train acc:{tacc},valid acc:{vacc}\n'
+              f'各类别平均正确率, 训练集VF:{t_VF}, SR:{t_SR},MA:{t_MA}\n,'
+              f'               测试集VF:{v_VF}, SR:{v_SR},MA:{v_MA} ')
+        tacc_set.append(tacc)
+        vacc_set.append(vacc)
+        t_VF_set.append(t_VF)
+        t_SR_set.append(t_SR)
+        t_MA_set.append(t_MA)
+        v_VF_set.append(v_VF)
+        v_SR_set.append(v_SR)
+        v_MA_set.append(v_MA)
+
+    print(
+        f'经过{config.n_average_times}次{config.k_fold_num}折交叉训练，得到平均指标，train acc:{np.array(tacc_set).mean()},valid acc:{np.array(vacc_set).mean()}\n')
+    print(
+        f'各类别平均正确率, 训练集VF:{np.array(t_VF_set).mean()}, SR:{np.array(t_SR_set).mean()},MA:{np.array(t_MA_set).mean()}\n'
+        f'               测试集VF:{np.array(v_VF_set).mean()}, SR:{np.array(v_SR_set).mean()},MA:{np.array(v_MA_set).mean()}\n'
+        f'各指标标准差     rain acc:{np.array(tacc_set).std()},valid acc:{np.array(vacc_set).std()}\n'
+        f'各类别正确率标准差, 训练集VF:{np.array(t_VF_set).std()}, SR:{np.array(t_SR_set).std()},MA:{np.array(t_MA_set).std()}\n'
+        f'               测试集VF:{np.array(v_VF_set).std()}, SR:{np.array(v_SR_set).std()},MA:{np.array(v_MA_set).std()}\n')
